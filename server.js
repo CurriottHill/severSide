@@ -90,11 +90,37 @@ app.post('/gemini', geminiRateLimiter, async (req, res) => {
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Missing prompt' })
     }
-    const text = await generateContent(prompt, { model })
-    res.json({ text })
+    // Retry on temporary overload conditions
+    const maxAttempts = 3
+    const baseDelay = 200 // ms
+    let lastErr
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const text = await generateContent(prompt, { model })
+        return res.json({ text })
+      } catch (e) {
+        lastErr = e
+        const msg = String(e?.message || '')
+        const overloaded = /\b(429|resource\s*exhausted|quota|unavailable|503)\b/i.test(msg)
+        const shouldRetry = overloaded && attempt < maxAttempts
+        if (shouldRetry) {
+          const delay = baseDelay * Math.pow(2, attempt - 1)
+          await new Promise(r => setTimeout(r, delay))
+          continue
+        }
+        break
+      }
+    }
+    console.warn('[Gemini] Failing gracefully after retries:', lastErr?.message || lastErr)
+    // Do not crash the client: reply with a friendly fallback text
+    return res.status(200).json({ text: 'Gemini is overloaded please try again later' })
   } catch (e) {
     console.error('[Gemini] Server error:', e)
     const status = (typeof e?.message === 'string' && e.message.includes('tokens max')) ? 400 : 500
+    // Graceful fallback even on unexpected errors
+    if (status >= 500) {
+      return res.status(200).json({ text: 'Gemini is overloaded please try again later' })
+    }
     res.status(status).json({ error: e.message || 'Gemini request failed' })
   }
 })
