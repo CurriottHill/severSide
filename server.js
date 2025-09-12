@@ -4,12 +4,13 @@ import dotenv from "dotenv";
 import cors from 'cors';
 import https from 'https';
 import { generateContent, streamGenerateContent } from './gemini.js'
-
+import path from 'path';
 // ! Load environment variables from .env
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
 
 // Use permissive defaults (handles preflight automatically)
 app.use(cors());
@@ -33,6 +34,7 @@ function geminiRateLimiter(req, res, next) {
   requestTimes.push(now);
   next();
 }
+
 
 // Lightweight status endpoint to expose current Gemini rate limit state for the frontend
 app.get('/gemini/limit', (req, res) => {
