@@ -18,6 +18,8 @@ app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
 
 // Use permissive defaults (handles preflight automatically)
 app.use(cors());
+// Explicitly handle preflight for all routes (some hosts require this)
+app.options('*', cors());
 
 // Reuse TLS connections to OpenAI to reduce latency
 const openAiAgent = new https.Agent({ keepAlive: true })
