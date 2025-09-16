@@ -45,38 +45,39 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
 });
 
-app.get("/status/:email", async (req, res) => {
+// Create a Stripe Checkout Session and return the URL
+app.post('/checkoutsession', async (req, res) => {
   try {
-    const [rows] = await pool.query("SELECT subscription_status FROM users WHERE email=?", [req.params.email]);
-    if (rows.length > 0 && rows[0].subscription_status === "active") {
-      res.json({ active: true });
-    } else {
-      res.json({ active: false });
+    if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_PRICE_ID) {
+      return res.status(500).json({ error: 'Stripe is not configured on the server' })
     }
-  } catch (e) {
-    console.error('[Status] DB error:', e);
-    res.json({ active: false });
-  }
-});
-
-app.post("/checkout", async (req, res) => {
-  try {
+    const { email } = req.body || {}
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
+      mode: 'subscription',
       line_items: [
         {
-          price: process.env.PRICE_ID,
+          price: process.env.STRIPE_PRICE_ID,
           quantity: 1,
         },
       ],
-      mode: "subscription",
-      success_url: "https://example.com/success",
-      cancel_url: "https://example.com/cancel",
-    });
-    res.json({ url: session.url });
+      allow_promotion_codes: true,
+      customer_email: typeof email === 'string' && email.includes('@') ? email : undefined,
+      success_url: (process.env.SUCCESS_URL || 'https://wurlo.ai/success') + '?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: process.env.CANCEL_URL || 'https://wurlo.ai/cancel',
+    })
+    return res.json({ url: session.url })
   } catch (e) {
-    console.error('[Checkout] Stripe error:', e);
-    res.status(500).json({ error: "Failed to create checkout session" });
+    console.error('[Stripe] Failed to create checkout session:', e)
+    return res.status(500).json({ error: e?.message || 'Failed to create checkout session' })
+  }
+})
+
+app.get("/status/:email", async (req, res) => {
+  const [rows] = await pool.query("SELECT subscription_status FROM users WHERE email=?", [req.params.email]);
+  if (rows.length > 0 && rows[0].subscription_status === "active") {
+    res.json({ active: true });
+  } else {
+    res.json({ active: false });
   }
 });
 
