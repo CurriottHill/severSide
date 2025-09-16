@@ -5,10 +5,14 @@ import cors from 'cors';
 import https from 'https';
 import { generateContent, streamGenerateContent } from './gemini.js'
 import path from 'path';
+import mysql from "mysql2/promise";
+import Stripe from "stripe";
+
 // ! Load environment variables from .env
 dotenv.config();
 
 const app = express();
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 app.use(express.json({ limit: '1mb' }));
 app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
 
@@ -34,6 +38,72 @@ function geminiRateLimiter(req, res, next) {
   requestTimes.push(now);
   next();
 }
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+});
+
+app.get("/status/:email", async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT subscription_status FROM users WHERE email=?", [req.params.email]);
+    if (rows.length > 0 && rows[0].subscription_status === "active") {
+      res.json({ active: true });
+    } else {
+      res.json({ active: false });
+    }
+  } catch (e) {
+    console.error('[Status] DB error:', e);
+    res.json({ active: false });
+  }
+});
+
+app.post("/checkout", async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price: process.env.PRICE_ID,
+          quantity: 1,
+        },
+      ],
+      mode: "subscription",
+      success_url: "https://example.com/success",
+      cancel_url: "https://example.com/cancel",
+    });
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error('[Checkout] Stripe error:', e);
+    res.status(500).json({ error: "Failed to create checkout session" });
+  }
+});
+
+app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.log(err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const email = session.customer_details.email;
+    const customerId = session.customer;
+
+    await pool.query(
+      "INSERT INTO users (email, subscription_status, stripe_customer_id) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE subscription_status='active', stripe_customer_id=?",
+      [email, "active", customerId, customerId]
+    );
+  }
+
+  res.json({ received: true });
+});
 
 
 // Lightweight status endpoint to expose current Gemini rate limit state for the frontend
