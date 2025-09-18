@@ -5,14 +5,11 @@ import cors from 'cors';
 import https from 'https';
 import { generateContent, streamGenerateContent } from './gemini.js'
 import path from 'path';
-import mysql from "mysql2/promise";
-import Stripe from "stripe";
 
 // ! Load environment variables from .env
 dotenv.config();
 
 const app = express();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 app.use(express.json({ limit: '1mb' }));
 app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
 
@@ -22,7 +19,7 @@ app.use(cors());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*')
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Stripe-Signature')
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
   if (req.method === 'OPTIONS') {
     return res.status(204).end()
   }
@@ -48,74 +45,6 @@ function geminiRateLimiter(req, res, next) {
   requestTimes.push(now);
   next();
 }
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-});
-
-// Create a Stripe Checkout Session and return the URL
-app.post('/checkoutsession', async (req, res) => {
-  try {
-    if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_PRICE_ID) {
-      return res.status(500).json({ error: 'Stripe is not configured on the server' })
-    }
-    const { email } = req.body || {}
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      line_items: [
-        {
-          price: process.env.STRIPE_PRICE_ID,
-          quantity: 1,
-        },
-      ],
-      allow_promotion_codes: true,
-      customer_email: typeof email === 'string' && email.includes('@') ? email : undefined,
-      success_url: (process.env.SUCCESS_URL || 'https://wurlo.ai/success') + '?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: process.env.CANCEL_URL || 'https://wurlo.ai/cancel',
-    })
-    return res.json({ url: session.url })
-  } catch (e) {
-    console.error('[Stripe] Failed to create checkout session:', e)
-    return res.status(500).json({ error: e?.message || 'Failed to create checkout session' })
-  }
-})
-
-app.get("/status/:email", async (req, res) => {
-  const [rows] = await pool.query("SELECT subscription_status FROM users WHERE email=?", [req.params.email]);
-  if (rows.length > 0 && rows[0].subscription_status === "active") {
-    res.json({ active: true });
-  } else {
-    res.json({ active: false });
-  }
-});
-
-app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.log(err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    const email = session.customer_details.email;
-    const customerId = session.customer;
-
-    await pool.query(
-      "INSERT INTO users (email, subscription_status, stripe_customer_id) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE subscription_status='active', stripe_customer_id=?",
-      [email, "active", customerId, customerId]
-    );
-  }
-
-  res.json({ received: true });
-});
-
 
 // Lightweight status endpoint to expose current Gemini rate limit state for the frontend
 app.get('/gemini/limit', (req, res) => {
