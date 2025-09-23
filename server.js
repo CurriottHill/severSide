@@ -72,6 +72,9 @@ void (async () => {
 })()
 
 // --- Auth & usage helpers ---
+// In-memory fallback when DB is unavailable: track tokens that should be treated as unlimited
+const unlimitedTokens = new Set()
+
 function getAuthTokenFromReq(req) {
   try {
     const h = String(req.headers['authorization'] || '')
@@ -84,10 +87,14 @@ async function findUserByToken(token) {
   const r = await pool.query('SELECT id, email, auth_token FROM users WHERE auth_token = $1 LIMIT 1', [token])
   return r.rows?.[0] || null
 }
-async function isUnlimited(userId) {
-  if (!pool || !userId) return false
-  const r = await pool.query('SELECT unlimited FROM user_entitlements WHERE user_id = $1 LIMIT 1', [userId])
-  return !!(r.rows?.[0]?.unlimited)
+async function isUnlimitedFor(user) {
+  if (pool && user && user.id) {
+    const r = await pool.query('SELECT unlimited FROM user_entitlements WHERE user_id = $1 LIMIT 1', [user.id])
+    return !!(r.rows?.[0]?.unlimited)
+  }
+  // DB not configured or no valid user id: fallback to in-memory token marker
+  const t = user?.auth_token || ''
+  return t ? unlimitedTokens.has(t) : false
 }
 async function getUsageCount(userId) {
   if (!pool || !userId) return 0
@@ -104,18 +111,23 @@ function newAuthToken() {
 
 // Create or return a user for the provided token (if token missing/invalid, create a new one)
 async function ensureUserForToken(token) {
-  if (!pool) throw new Error('db_not_configured')
-  if (token) {
-    const u = await findUserByToken(token)
-    if (u) return u
+  // If DB is available, use it. Else, return a transient user structure.
+  if (pool) {
+    if (token) {
+      const u = await findUserByToken(token)
+      if (u) return u
+    }
+    const t = newAuthToken()
+    const placeholderEmail = `anon+${t.slice(0, 12)}@example.invalid`
+    const r = await pool.query(
+      'INSERT INTO users (email, auth_token, created_at, updated_at) VALUES ($1, $2, now(), now()) RETURNING id, email, auth_token',
+      [placeholderEmail, t]
+    )
+    return r.rows[0]
   }
-  const t = newAuthToken()
-  const placeholderEmail = `anon+${t.slice(0, 12)}@example.invalid`
-  const r = await pool.query(
-    'INSERT INTO users (email, auth_token, created_at, updated_at) VALUES ($1, $2, now(), now()) RETURNING id, email, auth_token',
-    [placeholderEmail, t]
-  )
-  return r.rows[0]
+  // Fallback without DB: re-use provided token or mint a new one
+  const t = token || newAuthToken()
+  return { id: 0, email: `anon@fallback.invalid`, auth_token: t }
 }
 
 // ! Simple in-memory rate limiter: 5 requests per minute across all Gemini routes
@@ -192,16 +204,12 @@ app.post('/gemini', geminiRateLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Missing prompt' })
     }
     // Per-account quota enforcement (free: 2 calls total unless unlimited)
-    if (!pool) {
-      console.error('[Gemini] Missing DB config (DB_HOST). Set it in server/.env')
-      return res.status(500).json({ error: 'Server misconfigured: DB not configured' })
-    }
     const authHeaderToken = getAuthTokenFromReq(req)
     const user = await ensureUserForToken(authHeaderToken)
-    const unlimited = await isUnlimited(user.id)
+    const unlimited = await isUnlimitedFor(user)
     const FREE_LIMIT = 2
     if (!unlimited) {
-      const used = await getUsageCount(user.id)
+      const used = pool && user.id ? await getUsageCount(user.id) : 0
       if (used >= FREE_LIMIT) {
         return res.status(402).json({ error: 'quota_exceeded', limit: FREE_LIMIT })
       }
@@ -229,7 +237,7 @@ app.post('/gemini', geminiRateLimiter, async (req, res) => {
       }
     }
     if (generatedText) {
-      try { if (!unlimited) await recordUsage(user.id) } catch (e) { console.warn('[Gemini] recordUsage failed:', e?.message || e) }
+      try { if (!unlimited && pool && user.id) await recordUsage(user.id) } catch (e) { console.warn('[Gemini] recordUsage failed:', e?.message || e) }
       return res.json({ text: generatedText })
     }
     console.warn('[Gemini] Failing gracefully after retries:', lastErr?.message || lastErr)
@@ -757,10 +765,9 @@ app.get('/tts/stream', async (req, res) => {
 // --- Auth & Billing Endpoints ---
 app.post('/auth/ensure', async (req, res) => {
   try {
-    if (!pool) return res.status(500).json({ error: 'db_not_configured' })
     const token = getAuthTokenFromReq(req) || String(req.body?.token || '')
     const user = await ensureUserForToken(token)
-    const unlimited = await isUnlimited(user.id)
+    const unlimited = await isUnlimitedFor(user)
     return res.json({ token: user.auth_token, user_id: user.id, unlimited: !!unlimited })
   } catch (e) {
     console.error('[Auth] ensure error:', e)
@@ -771,7 +778,6 @@ app.post('/auth/ensure', async (req, res) => {
 app.post('/billing/create-checkout', async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: 'stripe_not_configured' })
-    if (!pool) return res.status(500).json({ error: 'db_not_configured' })
     const priceId = process.env.STRIPE_PRICE_ID
     if (!priceId) return res.status(500).json({ error: 'missing_price' })
     const token = getAuthTokenFromReq(req) || String(req.body?.token || '')
@@ -815,6 +821,13 @@ app.post('/stripe/webhook', async (req, res) => {
            ON CONFLICT (user_id) DO UPDATE SET unlimited = EXCLUDED.unlimited, updated_at = now()`,
           [userId]
         )
+      } else if (!pool) {
+        // Fallback: mark token as unlimited in memory if provided
+        const t = String(session?.metadata?.auth_token || '')
+        if (t) {
+          unlimitedTokens.add(t)
+          console.log('[Stripe] Marked token unlimited (memory fallback).')
+        }
       }
     }
     return res.json({ received: true })
