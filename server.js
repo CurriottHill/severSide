@@ -15,11 +15,11 @@ import Stripe from 'stripe';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const pool = new Pool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASS || '',
-  database: process.env.DB_NAME || 'mydb',
-  port: process.env.DB_PORT || 5432,
+  connectionString: process.env.DB_HOST,
+  // user: process.env.DB_USER || 'postgres',
+  // password: process.env.DB_PASS || '',
+  // database: process.env.DB_NAME || 'mydb',
+  // port: process.env.DB_PORT || 5432,
 });
 
 // Test DB connection
@@ -58,40 +58,9 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-// Create Stripe checkout session
-app.post('/create-checkout-session', authenticate, async (req, res) => {
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price: process.env.STRIPE_PRICE_ID,
-        quantity: 1,
-      }],
-      mode: 'payment',
-      success_url: `${req.protocol}://${req.get('host')}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.protocol}://${req.get('host')}/payment-cancel`,
-      metadata: {
-        user_id: req.user.id.toString(),
-      },
-    });
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error('Checkout session error:', error);
-    res.status(500).json({ error: 'Failed to create checkout session' });
-  }
-});
+const app = express();
 
-// Payment success page
-app.get('/payment-success', (req, res) => {
-  res.send('<h1>Payment successful! You now have unlimited access. Please log in.</h1>');
-});
-
-// Payment cancel page
-app.get('/payment-cancel', (req, res) => {
-  res.send('<h1>Payment cancelled.</h1>');
-});
-
-// Stripe webhook
+// Stripe webhook (needs raw body before JSON parsing)
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -117,7 +86,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   res.json({ received: true });
 });
 
-const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
 
@@ -179,6 +147,39 @@ app.get('/gemini/limit', authenticate, (req, res) => {
   const secondsRemaining = Math.ceil(msRemaining / 1000);
   res.json({ limit: reached ? 1 : 0, remaining, windowMs: WINDOW_MS, secondsRemaining });
 })
+
+// Create Stripe checkout session
+app.post('/create-checkout-session', authenticate, async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price: process.env.STRIPE_PRICE_ID,
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${req.protocol}://${req.get('host')}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${req.protocol}://${req.get('host')}/payment-cancel`,
+      metadata: {
+        user_id: req.user.id.toString(),
+      },
+    });
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Checkout session error:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// Payment success page
+app.get('/payment-success', (req, res) => {
+  res.send('<h1>Payment successful! You now have unlimited access. Please log in.</h1>');
+});
+
+// Payment cancel page
+app.get('/payment-cancel', (req, res) => {
+  res.send('<h1>Payment cancelled.</h1>');
+});
 
 // One-time (per client decision) warm-up of OpenAI TTS path to reduce first-byte latency
 app.post('/tts/warm', async (req, res) => {
