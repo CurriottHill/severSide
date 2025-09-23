@@ -115,17 +115,22 @@ function newAuthToken() {
 async function ensureUserForToken(token) {
   // If DB is available, use it. Else, return a transient user structure.
   if (pool) {
-    if (token) {
-      const u = await findUserByToken(token)
-      if (u) return u
+    try {
+      if (token) {
+        const u = await findUserByToken(token)
+        if (u) return u
+      }
+      const t = newAuthToken()
+      const placeholderEmail = `anon+${t.slice(0, 12)}@example.invalid`
+      const r = await pool.query(
+        'INSERT INTO users (email, auth_token, created_at, updated_at) VALUES ($1, $2, now(), now()) RETURNING id, email, auth_token',
+        [placeholderEmail, t]
+      )
+      return r.rows[0]
+    } catch (err) {
+      console.warn('[Auth] DB unavailable, using fallback token user:', err?.message || err)
+      // fall through to memory fallback
     }
-    const t = newAuthToken()
-    const placeholderEmail = `anon+${t.slice(0, 12)}@example.invalid`
-    const r = await pool.query(
-      'INSERT INTO users (email, auth_token, created_at, updated_at) VALUES ($1, $2, now(), now()) RETURNING id, email, auth_token',
-      [placeholderEmail, t]
-    )
-    return r.rows[0]
   }
   // Fallback without DB: re-use provided token or mint a new one
   const t = token || newAuthToken()
@@ -790,8 +795,19 @@ app.post('/billing/create-checkout', async (req, res) => {
     // Force https for non-local hosts because Stripe may reject non-https return URLs
     if (!/localhost|127\.0\.0\.1/i.test(host)) proto = 'https'
     const baseUrl = `${proto}://${host}`
+
+    // Auto-detect Checkout mode based on Price type
+    let sessionMode = 'payment'
+    try {
+      const price = await stripe.prices.retrieve(priceId)
+      if (price?.recurring) sessionMode = 'subscription'
+    } catch (err) {
+      // If retrieve fails, fall back to explicit env override or default 'payment'
+      if ((process.env.STRIPE_MODE || '').toLowerCase() === 'subscription') sessionMode = 'subscription'
+    }
+
     const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
+      mode: sessionMode,
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${baseUrl}/billing/cancel`,
@@ -801,7 +817,14 @@ app.post('/billing/create-checkout', async (req, res) => {
     return res.json({ url: session.url })
   } catch (e) {
     console.error('[Billing] create-checkout error:', e)
-    return res.status(500).json({ error: 'checkout_failed' })
+    const debug = process.env.STRIPE_DEBUG === '1'
+    const payload = { error: 'checkout_failed' }
+    if (debug) {
+      payload.type = e?.type || ''
+      payload.code = e?.code || ''
+      payload.message = e?.message || ''
+    }
+    return res.status(500).json(payload)
   }
 })
 
