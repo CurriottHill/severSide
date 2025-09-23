@@ -13,6 +13,8 @@ import crypto from 'crypto';
 dotenv.config();
 
 const app = express();
+// Honor X-Forwarded-* headers (needed on Render/Heroku to get correct protocol)
+app.set('trust proxy', true)
 // Capture raw body for Stripe webhook verification
 app.use(express.json({
   limit: '1mb',
@@ -782,7 +784,12 @@ app.post('/billing/create-checkout', async (req, res) => {
     if (!priceId) return res.status(500).json({ error: 'missing_price' })
     const token = getAuthTokenFromReq(req) || String(req.body?.token || '')
     const user = await ensureUserForToken(token)
-    const baseUrl = `${req.protocol}://${req.get('host')}`
+    const host = req.get('host')
+    const xf = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim()
+    let proto = xf || req.protocol || 'https'
+    // Force https for non-local hosts because Stripe may reject non-https return URLs
+    if (!/localhost|127\.0\.0\.1/i.test(host)) proto = 'https'
+    const baseUrl = `${proto}://${host}`
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{ price: priceId, quantity: 1 }],
