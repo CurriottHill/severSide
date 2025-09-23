@@ -40,7 +40,10 @@ const openAiAgent = new https.Agent({ keepAlive: true })
 
 // --- Database (PostgreSQL) and Stripe Setup ---
 const DB_URL = process.env.DB_HOST || ''
-const pool = DB_URL ? new Pool({ connectionString: DB_URL }) : null
+const pool = DB_URL ? new Pool({
+  connectionString: DB_URL,
+  ssl: /localhost|127\.0\.0\.1/i.test(DB_URL) ? false : { rejectUnauthorized: false },
+}) : null
 
 const stripeSecret = process.env.STRIPE_SECRET_KEY || ''
 const stripe = stripeSecret ? new Stripe(stripeSecret) : null
@@ -107,9 +110,10 @@ async function ensureUserForToken(token) {
     if (u) return u
   }
   const t = newAuthToken()
+  const placeholderEmail = `anon+${t.slice(0, 12)}@example.invalid`
   const r = await pool.query(
     'INSERT INTO users (email, auth_token, created_at, updated_at) VALUES ($1, $2, now(), now()) RETURNING id, email, auth_token',
-    [null, t]
+    [placeholderEmail, t]
   )
   return r.rows[0]
 }
