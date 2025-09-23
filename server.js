@@ -5,88 +5,21 @@ import cors from 'cors';
 import https from 'https';
 import { generateContent, streamGenerateContent } from './gemini.js'
 import path from 'path';
+import Stripe from 'stripe';
+import { Pool } from 'pg';
+import crypto from 'crypto';
 
 // ! Load environment variables from .env
 dotenv.config();
 
-import pkg from 'pg';
-const { Pool } = pkg;
-import Stripe from 'stripe';
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const pool = new Pool({
-  connectionString: process.env.DB_HOST,
-  // user: process.env.DB_USER || 'postgres',
-  // password: process.env.DB_PASS || '',
-  // database: process.env.DB_NAME || 'mydb',
-  // port: process.env.DB_PORT || 5432,
-});
-
-// Test DB connection
-pool.on('connect', () => console.log('Connected to PostgreSQL'));
-pool.on('error', (err) => console.error('PostgreSQL error:', err));
-
-// Ensure premium column exists
-(async () => {
-  try {
-    await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS premium BOOLEAN DEFAULT FALSE;
-    `);
-    console.log('Ensured premium column exists');
-  } catch (err) {
-    console.error('Error adding premium column:', err);
-  }
-})();
-
-// Auth middleware
-const authenticate = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  const token = authHeader.substring(7);
-  try {
-    const result = await pool.query('SELECT u.id, u.email, u.premium FROM tokens t JOIN users u ON t.user_id = u.id WHERE t.token = $1 AND (t.expired_at IS NULL OR t.expired_at > NOW())', [token]);
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-    req.user = result.rows[0];
-    next();
-  } catch (err) {
-    console.error('Auth error:', err);
-    res.status(500).json({ error: 'Authentication failed' });
-  }
-};
-
 const app = express();
-
-// Stripe webhook (needs raw body before JSON parsing)
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+// Capture raw body for Stripe webhook verification
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, res, buf) => {
+    try { req.rawBody = buf } catch {}
   }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const userId = session.metadata.user_id;
-    try {
-      await pool.query('UPDATE users SET premium = TRUE WHERE id = $1', [userId]);
-      console.log(`User ${userId} upgraded to premium`);
-    } catch (err) {
-      console.error('Error updating user premium:', err);
-    }
-  }
-
-  res.json({ received: true });
-});
-
-app.use(express.json({ limit: '1mb' }));
+}));
 app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
 
 // Use permissive defaults (handles preflight automatically)
@@ -105,81 +38,115 @@ app.use((req, res, next) => {
 // Reuse TLS connections to OpenAI to reduce latency
 const openAiAgent = new https.Agent({ keepAlive: true })
 
-// ! Simple in-memory rate limiter: 5 requests per minute per user, unlimited for premium
-const WINDOW_MS = 60_000, MAX_REQ = 10; // ! 60s window, max 10 hits per user
-let userRequestTimes = new Map(); // user_id => rolling timestamps (ms)
+// --- Database (PostgreSQL) and Stripe Setup ---
+const DB_URL = process.env.DB_HOST || ''
+const pool = DB_URL ? new Pool({ connectionString: DB_URL }) : null
+
+const stripeSecret = process.env.STRIPE_SECRET_KEY || ''
+const stripe = stripeSecret ? new Stripe(stripeSecret) : null
+
+async function ensureSchema() {
+  if (!pool) return
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS api_usage (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT now()
+    );
+  `)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_api_usage_user ON api_usage(user_id);`)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_entitlements (
+      user_id INTEGER PRIMARY KEY,
+      unlimited BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP NOT NULL DEFAULT now(),
+      updated_at TIMESTAMP NOT NULL DEFAULT now()
+    );
+  `)
+}
+void (async () => {
+  try { await ensureSchema() } catch (e) { console.error('[DB] ensureSchema failed:', e?.message || e) }
+})()
+
+// --- Auth & usage helpers ---
+function getAuthTokenFromReq(req) {
+  try {
+    const h = String(req.headers['authorization'] || '')
+    if (h.toLowerCase().startsWith('bearer ')) return h.slice(7).trim()
+  } catch {}
+  return ''
+}
+async function findUserByToken(token) {
+  if (!pool || !token) return null
+  const r = await pool.query('SELECT id, email, auth_token FROM users WHERE auth_token = $1 LIMIT 1', [token])
+  return r.rows?.[0] || null
+}
+async function isUnlimited(userId) {
+  if (!pool || !userId) return false
+  const r = await pool.query('SELECT unlimited FROM user_entitlements WHERE user_id = $1 LIMIT 1', [userId])
+  return !!(r.rows?.[0]?.unlimited)
+}
+async function getUsageCount(userId) {
+  if (!pool || !userId) return 0
+  const r = await pool.query('SELECT COUNT(*)::int AS c FROM api_usage WHERE user_id = $1', [userId])
+  return Number(r.rows?.[0]?.c || 0)
+}
+async function recordUsage(userId) {
+  if (!pool || !userId) return
+  await pool.query('INSERT INTO api_usage (user_id) VALUES ($1)', [userId])
+}
+function newAuthToken() {
+  return crypto.randomBytes(24).toString('hex')
+}
+
+// Create or return a user for the provided token (if token missing/invalid, create a new one)
+async function ensureUserForToken(token) {
+  if (!pool) throw new Error('db_not_configured')
+  if (token) {
+    const u = await findUserByToken(token)
+    if (u) return u
+  }
+  const t = newAuthToken()
+  const r = await pool.query(
+    'INSERT INTO users (email, auth_token, created_at, updated_at) VALUES ($1, $2, now(), now()) RETURNING id, email, auth_token',
+    [null, t]
+  )
+  return r.rows[0]
+}
+
+// ! Simple in-memory rate limiter: 5 requests per minute across all Gemini routes
+const WINDOW_MS = 60_000, MAX_REQ = 10; // ! 60s window, max 10 hits
+let requestTimes = []; // rolling timestamps (ms)
+let limitReached = false; // ! true when rate limit is currently exceeded
 
 function geminiRateLimiter(req, res, next) {
-  const userId = req.user.id;
-  if (req.user.premium) {
-    return next(); // No limit for premium
-  }
   const now = Date.now();
-  if (!userRequestTimes.has(userId)) {
-    userRequestTimes.set(userId, []);
+  requestTimes = requestTimes.filter(t => now - t < WINDOW_MS); // drop old entries
+  limitReached = requestTimes.length >= MAX_REQ; // ! set flag for observability
+  if (limitReached) {
+    // ! Rate limit hit: return 429 with no response body
+    return res.status(429).end();
   }
-  const times = userRequestTimes.get(userId);
-  times.push(now);
-  times.splice(0, times.length - MAX_REQ); // Keep only last MAX_REQ
-  const recent = times.filter(t => now - t < WINDOW_MS);
-  userRequestTimes.set(userId, recent);
-  if (recent.length >= MAX_REQ) {
-    return res.status(429).json({ error: 'Quota exceeded. Please upgrade to premium.', buy: true });
-  }
+  requestTimes.push(now);
   next();
 }
 
 // Lightweight status endpoint to expose current Gemini rate limit state for the frontend
-app.get('/gemini/limit', authenticate, (req, res) => {
-  const userId = req.user.id;
-  if (req.user.premium) {
-    return res.json({ limit: 0, remaining: Infinity, windowMs: WINDOW_MS, secondsRemaining: 0 });
+app.get('/gemini/limit', (req, res) => {
+  const now = Date.now()
+  // Refresh rolling window
+  requestTimes = requestTimes.filter(t => now - t < WINDOW_MS)
+  const reached = requestTimes.length >= MAX_REQ
+  limitReached = reached
+  const remaining = Math.max(0, MAX_REQ - requestTimes.length)
+  let msRemaining = 0
+  if (reached && requestTimes.length) {
+    // Time until the oldest request drops out of the rolling window
+    msRemaining = Math.max(0, WINDOW_MS - (now - requestTimes[0]))
   }
-  const now = Date.now();
-  const times = userRequestTimes.get(userId) || [];
-  const recent = times.filter(t => now - t < WINDOW_MS);
-  const reached = recent.length >= MAX_REQ;
-  const remaining = Math.max(0, MAX_REQ - recent.length);
-  let msRemaining = 0;
-  if (reached && recent.length) {
-    msRemaining = Math.max(0, WINDOW_MS - (now - recent[0]));
-  }
-  const secondsRemaining = Math.ceil(msRemaining / 1000);
-  res.json({ limit: reached ? 1 : 0, remaining, windowMs: WINDOW_MS, secondsRemaining });
+  const secondsRemaining = Math.ceil(msRemaining / 1000)
+  res.json({ limit: reached ? 1 : 0, remaining, windowMs: WINDOW_MS, secondsRemaining })
 })
-
-// Create Stripe checkout session
-app.post('/create-checkout-session', authenticate, async (req, res) => {
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price: process.env.STRIPE_PRICE_ID,
-        quantity: 1,
-      }],
-      mode: 'payment',
-      success_url: `${req.protocol}://${req.get('host')}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.protocol}://${req.get('host')}/payment-cancel`,
-      metadata: {
-        user_id: req.user.id.toString(),
-      },
-    });
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error('Checkout session error:', error);
-    res.status(500).json({ error: 'Failed to create checkout session' });
-  }
-});
-
-// Payment success page
-app.get('/payment-success', (req, res) => {
-  res.send('<h1>Payment successful! You now have unlimited access. Please log in.</h1>');
-});
-
-// Payment cancel page
-app.get('/payment-cancel', (req, res) => {
-  res.send('<h1>Payment cancelled.</h1>');
-});
 
 // One-time (per client decision) warm-up of OpenAI TTS path to reduce first-byte latency
 app.post('/tts/warm', async (req, res) => {
@@ -214,20 +181,36 @@ app.post('/tts/warm', async (req, res) => {
 // Lightweight ping for client preconnect
 app.get('/ping', (req, res) => res.status(204).end())
 // Proxy endpoint for Gemini text generation (kept for popup functionality)
-app.post('/gemini', authenticate, geminiRateLimiter, async (req, res) => {
+app.post('/gemini', geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Missing prompt' })
     }
+    // Per-account quota enforcement (free: 2 calls total unless unlimited)
+    if (!pool) {
+      console.error('[Gemini] Missing DB config (DB_HOST). Set it in server/.env')
+      return res.status(500).json({ error: 'Server misconfigured: DB not configured' })
+    }
+    const authHeaderToken = getAuthTokenFromReq(req)
+    const user = await ensureUserForToken(authHeaderToken)
+    const unlimited = await isUnlimited(user.id)
+    const FREE_LIMIT = 2
+    if (!unlimited) {
+      const used = await getUsageCount(user.id)
+      if (used >= FREE_LIMIT) {
+        return res.status(402).json({ error: 'quota_exceeded', limit: FREE_LIMIT })
+      }
+    }
     // Retry on temporary overload conditions
     const maxAttempts = 3
     const baseDelay = 200 // ms
     let lastErr
+    let generatedText = ''
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const text = await generateContent(prompt, { model })
-        return res.json({ text })
+        generatedText = await generateContent(prompt, { model })
+        break
       } catch (e) {
         lastErr = e
         const msg = String(e?.message || '')
@@ -240,6 +223,10 @@ app.post('/gemini', authenticate, geminiRateLimiter, async (req, res) => {
         }
         break
       }
+    }
+    if (generatedText) {
+      try { if (!unlimited) await recordUsage(user.id) } catch (e) { console.warn('[Gemini] recordUsage failed:', e?.message || e) }
+      return res.json({ text: generatedText })
     }
     console.warn('[Gemini] Failing gracefully after retries:', lastErr?.message || lastErr)
     // Do not crash the client: reply with a friendly fallback text
@@ -256,7 +243,7 @@ app.post('/gemini', authenticate, geminiRateLimiter, async (req, res) => {
 })
 
 // Silent variant: logs and returns 204 No Content
-app.post('/gemini/silent', authenticate, geminiRateLimiter, async (req, res) => {
+app.post('/gemini/silent', geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
@@ -274,7 +261,7 @@ app.post('/gemini/silent', authenticate, geminiRateLimiter, async (req, res) => 
 })
 
 // Streaming proxy endpoint using Server-Sent Events (SSE) (kept for popup functionality)
-app.post('/gemini/stream', authenticate, geminiRateLimiter, async (req, res) => {
+app.post('/gemini/stream', geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
@@ -440,7 +427,7 @@ app.post('/gemini/stream', authenticate, geminiRateLimiter, async (req, res) => 
 })
 
 // Silent streaming variant: consumes stream, logs chunks, 204 No Content
-app.post('/gemini/stream/silent', authenticate, geminiRateLimiter, async (req, res) => {
+app.post('/gemini/stream/silent', geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
@@ -761,6 +748,89 @@ app.get('/tts/stream', async (req, res) => {
     if (!res.headersSent) return res.status(500).json({ error: e.message || 'TTS stream failed' })
     try { res.end() } catch {}
   }
+})
+
+// --- Auth & Billing Endpoints ---
+app.post('/auth/ensure', async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: 'db_not_configured' })
+    const token = getAuthTokenFromReq(req) || String(req.body?.token || '')
+    const user = await ensureUserForToken(token)
+    const unlimited = await isUnlimited(user.id)
+    return res.json({ token: user.auth_token, user_id: user.id, unlimited: !!unlimited })
+  } catch (e) {
+    console.error('[Auth] ensure error:', e)
+    return res.status(500).json({ error: 'auth_failed' })
+  }
+})
+
+app.post('/billing/create-checkout', async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'stripe_not_configured' })
+    if (!pool) return res.status(500).json({ error: 'db_not_configured' })
+    const priceId = process.env.STRIPE_PRICE_ID
+    if (!priceId) return res.status(500).json({ error: 'missing_price' })
+    const token = getAuthTokenFromReq(req) || String(req.body?.token || '')
+    const user = await ensureUserForToken(token)
+    const baseUrl = `${req.protocol}://${req.get('host')}`
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl}/billing/cancel`,
+      client_reference_id: String(user.id),
+      metadata: { user_id: String(user.id), auth_token: user.auth_token || '' },
+    })
+    return res.json({ url: session.url })
+  } catch (e) {
+    console.error('[Billing] create-checkout error:', e)
+    return res.status(500).json({ error: 'checkout_failed' })
+  }
+})
+
+app.post('/stripe/webhook', async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).end()
+    const sig = req.headers['stripe-signature']
+    const secret = process.env.STRIPE_WEBHOOK_SECRET
+    if (!sig || !secret) return res.status(500).end()
+    let event
+    try {
+      event = stripe.webhooks.constructEvent(req.rawBody, sig, secret)
+    } catch (err) {
+      console.error('[Stripe] webhook verify failed:', err?.message || err)
+      return res.status(400).send(`Webhook Error: ${err.message}`)
+    }
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data?.object || {}
+      const userId = Number(session?.metadata?.user_id || session?.client_reference_id || 0)
+      if (pool && userId) {
+        await pool.query(
+          `INSERT INTO user_entitlements (user_id, unlimited, created_at, updated_at)
+           VALUES ($1, TRUE, now(), now())
+           ON CONFLICT (user_id) DO UPDATE SET unlimited = EXCLUDED.unlimited, updated_at = now()`,
+          [userId]
+        )
+      }
+    }
+    return res.json({ received: true })
+  } catch (e) {
+    console.error('[Stripe] webhook handler error:', e)
+    return res.status(500).end()
+  }
+})
+
+app.get('/billing/success', (req, res) => {
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Payment successful</title></head><body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px;">
+    <h2>Payment successful</h2>
+    <p>You can now close this tab and return to the extension. Your account has been upgraded.</p>
+  </body></html>`)
+})
+app.get('/billing/cancel', (req, res) => {
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Checkout canceled</title></head><body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px;">
+    <h2>Checkout canceled</h2>
+    <p>No charge was made. You can close this tab and try again later.</p>
+  </body></html>`)
 })
 
 const port = process.env.PORT || 3000;
