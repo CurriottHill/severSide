@@ -9,6 +9,114 @@ import path from 'path';
 // ! Load environment variables from .env
 dotenv.config();
 
+import pkg from 'pg';
+const { Pool } = pkg;
+import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASS || '',
+  database: process.env.DB_NAME || 'mydb',
+  port: process.env.DB_PORT || 5432,
+});
+
+// Test DB connection
+pool.on('connect', () => console.log('Connected to PostgreSQL'));
+pool.on('error', (err) => console.error('PostgreSQL error:', err));
+
+// Ensure premium column exists
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS premium BOOLEAN DEFAULT FALSE;
+    `);
+    console.log('Ensured premium column exists');
+  } catch (err) {
+    console.error('Error adding premium column:', err);
+  }
+})();
+
+// Auth middleware
+const authenticate = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const token = authHeader.substring(7);
+  try {
+    const result = await pool.query('SELECT u.id, u.email, u.premium FROM tokens t JOIN users u ON t.user_id = u.id WHERE t.token = $1 AND (t.expired_at IS NULL OR t.expired_at > NOW())', [token]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    req.user = result.rows[0];
+    next();
+  } catch (err) {
+    console.error('Auth error:', err);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+};
+
+// Create Stripe checkout session
+app.post('/create-checkout-session', authenticate, async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price: process.env.STRIPE_PRICE_ID,
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${req.protocol}://${req.get('host')}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${req.protocol}://${req.get('host')}/payment-cancel`,
+      metadata: {
+        user_id: req.user.id.toString(),
+      },
+    });
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Checkout session error:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// Payment success page
+app.get('/payment-success', (req, res) => {
+  res.send('<h1>Payment successful! You now have unlimited access. Please log in.</h1>');
+});
+
+// Payment cancel page
+app.get('/payment-cancel', (req, res) => {
+  res.send('<h1>Payment cancelled.</h1>');
+});
+
+// Stripe webhook
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.metadata.user_id;
+    try {
+      await pool.query('UPDATE users SET premium = TRUE WHERE id = $1', [userId]);
+      console.log(`User ${userId} upgraded to premium`);
+    } catch (err) {
+      console.error('Error updating user premium:', err);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use("/privacy", express.static(path.join(process.cwd(), "privacy.html")));
@@ -29,38 +137,47 @@ app.use((req, res, next) => {
 // Reuse TLS connections to OpenAI to reduce latency
 const openAiAgent = new https.Agent({ keepAlive: true })
 
-// ! Simple in-memory rate limiter: 5 requests per minute across all Gemini routes
-const WINDOW_MS = 60_000, MAX_REQ = 10; // ! 60s window, max 10 hits
-let requestTimes = []; // rolling timestamps (ms)
-let limitReached = false; // ! true when rate limit is currently exceeded
+// ! Simple in-memory rate limiter: 5 requests per minute per user, unlimited for premium
+const WINDOW_MS = 60_000, MAX_REQ = 10; // ! 60s window, max 10 hits per user
+let userRequestTimes = new Map(); // user_id => rolling timestamps (ms)
 
 function geminiRateLimiter(req, res, next) {
-  const now = Date.now();
-  requestTimes = requestTimes.filter(t => now - t < WINDOW_MS); // drop old entries
-  limitReached = requestTimes.length >= MAX_REQ; // ! set flag for observability
-  if (limitReached) {
-    // ! Rate limit hit: return 429 with no response body
-    return res.status(429).end();
+  const userId = req.user.id;
+  if (req.user.premium) {
+    return next(); // No limit for premium
   }
-  requestTimes.push(now);
+  const now = Date.now();
+  if (!userRequestTimes.has(userId)) {
+    userRequestTimes.set(userId, []);
+  }
+  const times = userRequestTimes.get(userId);
+  times.push(now);
+  times.splice(0, times.length - MAX_REQ); // Keep only last MAX_REQ
+  const recent = times.filter(t => now - t < WINDOW_MS);
+  userRequestTimes.set(userId, recent);
+  if (recent.length >= MAX_REQ) {
+    return res.status(429).json({ error: 'Quota exceeded. Please upgrade to premium.', buy: true });
+  }
   next();
 }
 
 // Lightweight status endpoint to expose current Gemini rate limit state for the frontend
-app.get('/gemini/limit', (req, res) => {
-  const now = Date.now()
-  // Refresh rolling window
-  requestTimes = requestTimes.filter(t => now - t < WINDOW_MS)
-  const reached = requestTimes.length >= MAX_REQ
-  limitReached = reached
-  const remaining = Math.max(0, MAX_REQ - requestTimes.length)
-  let msRemaining = 0
-  if (reached && requestTimes.length) {
-    // Time until the oldest request drops out of the rolling window
-    msRemaining = Math.max(0, WINDOW_MS - (now - requestTimes[0]))
+app.get('/gemini/limit', authenticate, (req, res) => {
+  const userId = req.user.id;
+  if (req.user.premium) {
+    return res.json({ limit: 0, remaining: Infinity, windowMs: WINDOW_MS, secondsRemaining: 0 });
   }
-  const secondsRemaining = Math.ceil(msRemaining / 1000)
-  res.json({ limit: reached ? 1 : 0, remaining, windowMs: WINDOW_MS, secondsRemaining })
+  const now = Date.now();
+  const times = userRequestTimes.get(userId) || [];
+  const recent = times.filter(t => now - t < WINDOW_MS);
+  const reached = recent.length >= MAX_REQ;
+  const remaining = Math.max(0, MAX_REQ - recent.length);
+  let msRemaining = 0;
+  if (reached && recent.length) {
+    msRemaining = Math.max(0, WINDOW_MS - (now - recent[0]));
+  }
+  const secondsRemaining = Math.ceil(msRemaining / 1000);
+  res.json({ limit: reached ? 1 : 0, remaining, windowMs: WINDOW_MS, secondsRemaining });
 })
 
 // One-time (per client decision) warm-up of OpenAI TTS path to reduce first-byte latency
@@ -96,7 +213,7 @@ app.post('/tts/warm', async (req, res) => {
 // Lightweight ping for client preconnect
 app.get('/ping', (req, res) => res.status(204).end())
 // Proxy endpoint for Gemini text generation (kept for popup functionality)
-app.post('/gemini', geminiRateLimiter, async (req, res) => {
+app.post('/gemini', authenticate, geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
@@ -138,7 +255,7 @@ app.post('/gemini', geminiRateLimiter, async (req, res) => {
 })
 
 // Silent variant: logs and returns 204 No Content
-app.post('/gemini/silent', geminiRateLimiter, async (req, res) => {
+app.post('/gemini/silent', authenticate, geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
@@ -156,7 +273,7 @@ app.post('/gemini/silent', geminiRateLimiter, async (req, res) => {
 })
 
 // Streaming proxy endpoint using Server-Sent Events (SSE) (kept for popup functionality)
-app.post('/gemini/stream', geminiRateLimiter, async (req, res) => {
+app.post('/gemini/stream', authenticate, geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
@@ -322,7 +439,7 @@ app.post('/gemini/stream', geminiRateLimiter, async (req, res) => {
 })
 
 // Silent streaming variant: consumes stream, logs chunks, 204 No Content
-app.post('/gemini/stream/silent', geminiRateLimiter, async (req, res) => {
+app.post('/gemini/stream/silent', authenticate, geminiRateLimiter, async (req, res) => {
   try {
     const { prompt, model } = req.body || {}
     if (!prompt || typeof prompt !== 'string') {
